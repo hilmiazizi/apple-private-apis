@@ -5,7 +5,7 @@ use std::{collections::HashMap, fs, io::Cursor, path::PathBuf};
 
 use base64::engine::general_purpose;
 use chrono::{DateTime, SubsecRound, Utc};
-use log::debug;
+use log::{debug, warn};
 use plist::{Data, Dictionary};
 use reqwest::{Certificate, Client, ClientBuilder, Proxy, RequestBuilder};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -283,6 +283,9 @@ impl AnisetteClient {
             ProvisioningSuccess {
                 #[allow(dead_code)] // it's not even dead, rust just has problems
                 adi_pb: String
+            },
+            EndProvisioningError {
+                message: Option<String>,
             }
         }
 
@@ -352,6 +355,9 @@ impl AnisetteClient {
                         connection.close(None).await?;
                         break;
                     }
+                    ProvisionInput::EndProvisioningError { message } => {
+                        return Err(AnisetteError::InvalidArgument(message.unwrap_or_else(|| "EndProvisioningError".to_string())));
+                    }
                 }
             } else if data.is_close() {
                 break;
@@ -381,43 +387,20 @@ impl RemoteAnisetteProviderV3 {
             info
         }
     }
+
+    async fn fetch_simple_headers(&self) -> Result<HashMap<String, String>, AnisetteError> {
+        warn!("Using sidestore GET fallback for anisette headers");
+        let http_client = make_reqwest()?;
+        let resp: HashMap<String, String> = http_client.get(&self.client_url)
+            .send().await?
+            .json().await?;
+        Ok(resp)
+    }
 }
 
 impl AnisetteProvider for RemoteAnisetteProviderV3 {
     async fn get_anisette_headers(&mut self) -> Result<HashMap<String, String>, AnisetteError> {
-        if self.client.is_none() {
-            self.client = Some(AnisetteClient::new(self.client_url.clone(), self.info.clone()).await?);
-        }
-        let client = self.client.as_ref().unwrap();
-
-        fs::create_dir_all(&self.configuration_path)?;
-
-        let config_path = self.configuration_path.join("state.plist");
-        if self.state.is_none() {
-            self.state = Some(if let Ok(text) = plist::from_file(&config_path) {
-                text
-            } else {
-                AnisetteState::new()
-            });
-        }
-
-        let state = self.state.as_mut().unwrap();
-        if !state.is_provisioned() {
-            client.provision(state).await?;
-            plist::to_file_xml(&config_path, state)?;
-        }
-        let data = match client.get_headers(&state).await {
-            Ok(data) => data,
-            Err(err) => {
-                if matches!(err, AnisetteError::AnisetteNotProvisioned) {
-                    state.adi_pb = None;
-                    client.provision(state).await?;
-                    plist::to_file_xml(config_path, state)?;
-                    client.get_headers(&state).await?
-                } else { panic!() }
-            },
-        };
-        Ok(data.get_headers())
+        self.fetch_simple_headers().await
     }
 }
 

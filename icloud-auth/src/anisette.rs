@@ -133,7 +133,7 @@ impl AnisetteData {
                 
             ].into_iter().map(|(a, b)| (a.to_string(), Value::String(b.to_string()))))
             .chain([
-                ("X-Apple-Offer-Security-Upgrade", Value::Boolean(true)),
+                ("X-Apple-Offer-Security-Upgrade", Value::Boolean(false)),
                 ("at", Value::Integer(0.into())),
                 ("bootstrap", Value::Boolean(true)),
                 ("ckgen", Value::Boolean(true)),

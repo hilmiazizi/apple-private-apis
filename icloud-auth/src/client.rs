@@ -314,7 +314,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                 }
                 LoginState::LoggedIn => return Ok(_self),
                 LoginState::NeedsExtraStep(step) => {
-                    if _self.get_pet().is_some() {
+                    if _self.get_delegate_password().is_some() {
                         return Ok(_self)
                     } else {
                         return Err(Error::ExtraStep(step))
@@ -326,6 +326,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     pub fn get_pet(&self) -> Option<String> {
         self.tokens.get("com.apple.gs.idms.pet").map(|t| &t.token).cloned()
+    }
+
+    pub fn get_delegate_password(&self) -> Option<String> {
+        self.get_pet().or_else(|| {
+            self.tokens.get("com.apple.gs.appleid.auth").map(|t| t.token.clone())
+        })
     }
 
     pub fn get_name(&self) -> (String, String) {
@@ -740,14 +746,15 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         plist::to_writer_xml(&mut buffer, &packet)?;
         let buffer = String::from_utf8(buffer).unwrap();
 
-        let res = self
+        let http_res = self
             .client
             .post(GSA_ENDPOINT)
             .headers(gsa_headers.clone())
             .body(buffer)
-            .send().await;
+            .send().await?;
 
-        let res = parse_response(res).await?;
+        let response_headers = http_res.headers().clone();
+        let res = parse_response(Ok(http_res)).await?;
         let err_check = Self::check_error(&res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());
@@ -775,6 +782,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             }).collect();
             self.tokens = keys;
         }
+        self.ingest_auth_headers(&response_headers);
         debug!("spd {:?}", decoded_spd);
 
         self.username = Some(decoded_spd.get("acname").expect("No account name?").as_string().unwrap().to_string());
@@ -784,6 +792,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             return match s.as_str() {
                 "trustedDeviceSecondaryAuth" => Ok(LoginState::NeedsDevice2FA),
                 "secondaryAuth" => Ok(LoginState::NeedsSMS2FA),
+                // Apple nags legacy/no-2FA accounts to upgrade; native clients ignore and continue.
+                "securityUpgrade" => Ok(LoginState::LoggedIn),
+                _unk if self.get_delegate_password().is_some() => Ok(LoginState::LoggedIn),
                 _unk => Ok(LoginState::NeedsExtraStep(_unk.to_string()))
             }
         }
@@ -1037,6 +1048,26 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     fn parse_pet_header(&mut self, data: &str) {
         let decoded = String::from_utf8(base64::decode(data).unwrap()).unwrap();
         self.tokens.insert("com.apple.gs.idms.pet".to_string(), FetchedToken { token: decoded.split(":").nth(1).unwrap().to_string(), expiration: SystemTime::now() + Duration::from_secs(decoded.split(":").nth(2).map(|a| a.parse::<u64>().expect("Bad pet format")).unwrap_or(300)) });
+    }
+
+    fn ingest_auth_headers(&mut self, headers: &HeaderMap) {
+        for header in headers.get_all("X-Apple-GS-Token").iter().chain(headers.get_all("X-Apple-HB-Token").iter()) {
+            let decoded = String::from_utf8(base64::decode(header.as_bytes()).expect("Not base64!")).expect("Decoded not utf8!");
+            let parts = decoded.split(":").collect::<Vec<&str>>();
+            let exp = parts.get(2).or(parts.get(3)).map(|i| i.parse().expect("Bad expiration format?")).unwrap_or(31536000);
+            let time = if exp > 40 * 365 * 24 * 60 * 60 * 1000 {
+                SystemTime::UNIX_EPOCH + Duration::from_millis(exp)
+            } else {
+                SystemTime::now() + Duration::from_secs(exp)
+            };
+            self.tokens.insert(parts[0].to_string(), FetchedToken {
+                token: parts[1].to_string(),
+                expiration: time,
+            });
+        }
+        if let Some(pet) = headers.get("X-Apple-PE-Token") {
+            self.parse_pet_header(pet.to_str().unwrap());
+        }
     }
 
     fn check_error(res: &plist::Dictionary) -> Result<(), Error> {
