@@ -329,9 +329,26 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     }
 
     pub fn get_delegate_password(&self) -> Option<String> {
-        self.get_pet().or_else(|| {
-            self.tokens.get("com.apple.gs.appleid.auth").map(|t| t.token.clone())
-        })
+        self.setup_delegate_token_candidates()
+            .into_iter()
+            .next()
+            .map(|(token, _)| token)
+    }
+
+    /// Tokens to try for setup.icloud.com Basic auth, in native-client order.
+    pub fn setup_delegate_token_candidates(&self) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        if let Some(t) = self.get_pet() {
+            out.push((t, "com.apple.gs.idms.pet"));
+        }
+        if let Some(tok) = self.tokens.get("com.apple.gs.icloud.auth") {
+            out.push((tok.token.clone(), "com.apple.gs.icloud.auth"));
+        }
+        if let Some(tok) = self.tokens.get("com.apple.gs.appleid.auth") {
+            out.push((tok.token.clone(), "com.apple.gs.appleid.auth"));
+        }
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
     }
 
     pub fn get_name(&self) -> (String, String) {
@@ -786,7 +803,21 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         debug!("spd {:?}", decoded_spd);
 
         self.username = Some(decoded_spd.get("acname").expect("No account name?").as_string().unwrap().to_string());
+        let status_code = decoded_spd.get("status-code").and_then(|v| v.as_unsigned_integer());
         self.spd = Some(decoded_spd);
+
+        let au = status.get("au").and_then(|v| v.as_string().map(|s| s.to_string()));
+        log::info!(
+            "GSA login complete for {} status-code={:?} au={:?} setup_tokens=[{}]",
+            self.username.as_ref().unwrap(),
+            status_code,
+            au,
+            self.setup_delegate_token_candidates()
+                .iter()
+                .map(|(_, kind)| *kind)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         if let Some(plist::Value::String(s)) = status.get("au") {
             return match s.as_str() {
@@ -993,9 +1024,16 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         if let Some(pet) = headers.get("X-Apple-PE-Token") {
             self.parse_pet_header(pet.to_str().unwrap());
+            log::info!("2FA complete, PET obtained");
             return Ok(LoginState::LoggedIn);
         }
 
+        if self.get_pet().is_some() {
+            log::info!("2FA complete, PET obtained from GS token headers");
+            return Ok(LoginState::LoggedIn);
+        }
+
+        log::warn!("2FA validate succeeded but no PET token in response headers");
         Ok(LoginState::NeedsLogin)
     }
 
