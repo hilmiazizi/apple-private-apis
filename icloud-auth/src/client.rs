@@ -325,6 +325,16 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     }
 
     pub fn get_pet(&self) -> Option<String> {
+        // Prefer SPD: header ingestion can strip the trailing "=PET" suffix delegate login requires.
+        if let Some(spd) = &self.spd {
+            if let Some(plist::Value::Dictionary(t)) = spd.get("t") {
+                if let Some(plist::Value::Dictionary(pet)) = t.get("com.apple.gs.idms.pet") {
+                    if let Some(token) = pet.get("token").and_then(|v| v.as_string()) {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
         self.tokens.get("com.apple.gs.idms.pet").map(|t| &t.token).cloned()
     }
 
@@ -1098,13 +1108,16 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             } else {
                 SystemTime::now() + Duration::from_secs(exp)
             };
-            self.tokens.insert(parts[0].to_string(), FetchedToken {
+            // SPD token dict is authoritative; response headers must not clobber it.
+            self.tokens.entry(parts[0].to_string()).or_insert(FetchedToken {
                 token: parts[1].to_string(),
                 expiration: time,
             });
         }
         if let Some(pet) = headers.get("X-Apple-PE-Token") {
-            self.parse_pet_header(pet.to_str().unwrap());
+            if !self.tokens.contains_key("com.apple.gs.idms.pet") {
+                self.parse_pet_header(pet.to_str().unwrap());
+            }
         }
     }
 
