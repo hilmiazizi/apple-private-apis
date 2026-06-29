@@ -388,6 +388,9 @@ impl RemoteAnisetteProviderV3 {
         }
     }
 
+    // Shared, single-machine-identity GET. Kept for reference/debugging only;
+    // unusable for IDS registration because the fingerprint is shared by everyone.
+    #[allow(dead_code)]
     async fn fetch_simple_headers(&self) -> Result<HashMap<String, String>, AnisetteError> {
         warn!("Using sidestore GET fallback for anisette headers");
         let http_client = make_reqwest()?;
@@ -400,7 +403,53 @@ impl RemoteAnisetteProviderV3 {
 
 impl AnisetteProvider for RemoteAnisetteProviderV3 {
     async fn get_anisette_headers(&mut self) -> Result<HashMap<String, String>, AnisetteError> {
-        self.fetch_simple_headers().await
+        // Provision and use our OWN ADI machine via the v3 protocol instead of the
+        // shared `fetch_simple_headers` GET. The bare GET returns the anisette
+        // server's single, globally-shared machine identity (same X-Apple-I-MD-M
+        // for every caller); Apple's iMessage/IDS provisioning rejects that with
+        // UNAUTHORIZED ("These account credentials are unauthorized") even though
+        // plain GSA auth tolerates it. Provisioning a per-client machine (bound to
+        // a unique keychain_identifier, persisted to disk so it stays stable across
+        // runs) yields a unique fingerprint that IDS will accept.
+        if self.client.is_none() {
+            self.client = Some(AnisetteClient::new(self.client_url.clone(), self.info.clone()).await?);
+        }
+
+        // The configured path may be a directory (e.g. "anisette_test"); keep the
+        // provisioned-machine state in a file inside it so the SAME unique machine
+        // identity is reused across runs. Renewals must use the machine the
+        // registration was bound to, otherwise Apple rejects them.
+        let state_path = if self.configuration_path.is_dir() {
+            self.configuration_path.join("anisette_v3_state.plist")
+        } else {
+            self.configuration_path.clone()
+        };
+
+        if self.state.is_none() {
+            self.state = Some(plist::from_file(&state_path).unwrap_or_default());
+        }
+
+        let client = self.client.as_ref().unwrap();
+        let state = self.state.as_mut().unwrap();
+
+        if !state.is_provisioned() {
+            client.provision(state).await?;
+            let _ = plist::to_file_xml(&state_path, &*state);
+        }
+
+        let data = match client.get_headers(state).await {
+            Ok(data) => data,
+            Err(AnisetteError::AnisetteNotProvisioned) => {
+                // Stored adi_pb was rejected; re-provision a fresh machine once.
+                state.adi_pb = None;
+                client.provision(state).await?;
+                let _ = plist::to_file_xml(&state_path, &*state);
+                client.get_headers(state).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        Ok(data.get_headers())
     }
 }
 

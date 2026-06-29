@@ -903,6 +903,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if !res.status().is_success() {
+            let status = res.status();
+            let resp_body = res.text().await.unwrap_or_default();
+            error!("send_sms_2fa_to_devices failed: HTTP {} — body: {}", status, resp_body);
             return Err(Error::AuthSrp);
         }
 
